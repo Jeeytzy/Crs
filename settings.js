@@ -9,6 +9,8 @@ filepath: '@Jeeyhosting',
 ownername: '@Jeeyhosting',
 owner: '7804463533',
 token: '8374179615:AAH_nIQYYaYLCHqT-P-nI9PDqq9QmFD8F6E',
+telegram_proxy: '', // Contoh: 'http://user:pass@proxy-host:port' bila wajib pakai proxy
+business_mode: true, // Aktifkan mode bisnis untuk menonaktifkan fitur hiburan
 
 //——————[ Set bash ]————————//
 tokeninstall: 'alfibila',
@@ -34,6 +36,10 @@ FeeTransaksi: 500, // Rubah Sesuai Keinginan Anda
 
 //——————————[ Set VirtuSim ]————————//
 VirtuSimKey: "vSjYh5Z2PIEVt3dzJnFm9qD7QciwyA",
+virtualSimProxies: [
+  // Contoh: 'http://user:pass@sg-proxy.example.com:3128'
+  // Tambahkan daftar proxy/VPN (prioritas pertama akan dicoba lebih dulu)
+],
 
 //——————————[ Set metode menual ]—————//
 nomor_pencairan: "-",
@@ -44,10 +50,8 @@ ovo: '083122028438',
 gopay: '083122028438',
 bni: '-',
 
-//——————————[ Set Orderkuota ]————————//
-merchantidorderkuota:'-',
-apiorderkuota: '',
-qrisorderkuota: '-',
+//——————————[ Orderkuota ]————————//
+// Gateway lama sudah diganti CiaaTopUp. Biarkan kosong atau hapus nilai lama.
 pinorkut: '-',
 pworkut: '-',
 pinh2h: '-',

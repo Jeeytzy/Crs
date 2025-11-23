@@ -152,6 +152,29 @@ rm -rf node_modules package-lock.json
 npm install
 ```
 
+## ⬆️ Mengirim perubahan ke GitHub
+
+Jika Anda sudah meng-clone proyek ini di server (termasuk via panel Pterodactyl) tetapi tidak melihat pembaruan di GitHub, kemungkinan repository lokal belum dihubungkan atau belum di-push. Berikut langkah singkatnya:
+
+1. Tambahkan remote GitHub (ganti `<URL_REPO_GITHUB>` dengan URL repo Anda):
+   ```bash
+   git remote add origin <URL_REPO_GITHUB>
+   ```
+   Jika remote sudah ada tetapi berbeda, sesuaikan dengan: `git remote set-url origin <URL_REPO_GITHUB>`
+
+2. Pastikan branch lokal Anda (misalnya `work` atau `main`) siap di-push:
+   ```bash
+   git status
+   git log --oneline -5
+   ```
+
+3. Push perubahan ke GitHub:
+   ```bash
+   git push -u origin work  # atau nama branch yang Anda gunakan
+   ```
+
+Tanpa menambahkan remote dan melakukan push, perubahan hanya tersimpan di server lokal dan tidak akan muncul di halaman GitHub.
+
 ## 📞 Support
 
 - **Developer**: @Jeeyhosting

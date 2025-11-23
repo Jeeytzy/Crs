@@ -61,6 +61,35 @@ const settings = require('./settings');
 const CiaaTopUpAPI = require('./ciaaTopUpAPI'); // Import CiaaTopUp API Helper
 const token = settings.token;
 const BOT_TOKEN = process.env.BOT_TOKEN || token;
+const TELEGRAM_PROXY = process.env.TELEGRAM_PROXY || settings.telegram_proxy || '';
+const BUSINESS_ONLY = settings.business_mode !== false;
+const BUSINESS_DISABLED_MSG = '❌ Fitur ini dinonaktifkan karena bot difokuskan untuk layanan bisnis. Hubungi admin jika memang diperlukan.';
+
+const blockIfBusinessMode = (chatId, featureLabel = 'Fitur ini') => {
+  if (!BUSINESS_ONLY) return false;
+  bot.sendMessage(chatId, `${BUSINESS_DISABLED_MSG}\n\n(${featureLabel})`);
+  return true;
+};
+
+if (!BOT_TOKEN) {
+  throw new Error("Bot token is missing. Set BOT_TOKEN env or 'token' in settings.js");
+}
+
+// Beberapa environment (termasuk panel) memaksa koneksi lewat proxy dan
+// menyebabkan error "tunneling socket could not be established" saat polling
+// Telegram. Bila pengguna menyiapkan TELEGRAM_PROXY khusus, gunakan itu;
+// kalau tidak, bersihkan proxy global agar koneksi langsung ke Telegram.
+const proxyEnvKeys = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'];
+const telegramRequestOptions = { proxy: null, timeout: 60000 };
+
+if (TELEGRAM_PROXY) {
+  telegramRequestOptions.proxy = TELEGRAM_PROXY;
+  console.info('TELEGRAM_PROXY terdeteksi, koneksi bot akan mencoba lewat proxy ini.');
+} else {
+  proxyEnvKeys.forEach((key) => {
+    if (process.env[key]) delete process.env[key];
+  });
+}
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
@@ -79,9 +108,7 @@ const GITHUB_TOKEN = settings.githubtoken;
 const REPO_OWNER = settings.repoowner;
 const REPO_NAME = settings.reponame; 
 const FILE_PATH = settings.filepath;
-const merchantIdOrderKuota = settings.merchantidorderkuota;
-const apiOrderKuota = settings.apiorderkuota;
-const qrisOrderKuota = settings.qrisorderkuota;
+// Legacy OrderKuota bridge has been retired—payment will be routed via CiaaTopUp instead.
 const Tokeninstall = settings.tokeninstall;
 const Bash = settings.bash;
 const pinOrkut = settings.pinorkut;
@@ -120,6 +147,74 @@ const sviddepo = path.join(__dirname, './Database/sviddepo.json');
 const bannedFile = path.join(__dirname, './Database/banned.json');
 const welcomeFile = path.join(__dirname, './Database/welcome.json');
 let welcomeData = {};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Legacy OrderKuota shim → CiaaTopUp
+// Banyak flow pembayaran lama masih memanggil endpoint OrderKuota. Bagian ini
+// mengalihkan permintaan tersebut ke CiaaTopUp agar tidak ada lagi dependensi
+// gateway lama sekaligus menjaga kompatibilitas alur yang sudah ada.
+const nativeFetch = global.fetch;
+const orderKuotaBridgedPayments = [];
+
+global.fetch = async (resource, options) => {
+  if (typeof resource === 'string' && resource.includes('restapi.jeeyhosting.apibotwa.biz.id/api/orkut')) {
+    const url = new URL(resource);
+
+    try {
+      if (url.pathname.includes('createpayment')) {
+        const amount = Number(url.searchParams.get('amount') || 0);
+        const reff = url.searchParams.get('reff') || `ORD-${Date.now()}`;
+
+        const deposit = await ciaaAPI.createDeposit(amount, 'QRISFAST', reff);
+        if (!deposit.status) {
+          const payload = { success: false, message: deposit.message || 'Gagal membuat pembayaran via CiaaTopUp' };
+          return new Response(JSON.stringify(payload), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const info = deposit.data;
+        orderKuotaBridgedPayments.push({ id: info.id, amount: info.nominal });
+
+        const payload = {
+          result: {
+            transactionId: info.id,
+            amount: info.nominal,
+            qrImageUrl: info.qr_image,
+            expirationTime: info.expired_at
+          }
+        };
+
+        return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (url.pathname.includes('cekstatus')) {
+        // Cari transaksi aktif dan cek statusnya via CiaaTopUp
+        while (orderKuotaBridgedPayments.length) {
+          const current = orderKuotaBridgedPayments[0];
+          const check = await ciaaAPI.checkDepositStatus(current.id);
+
+          if (!check.status) {
+            break;
+          }
+
+          if (check.data.status !== 'pending') {
+            orderKuotaBridgedPayments.shift();
+            const payload = { amount: current.amount, status: check.data.status };
+            return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json' } });
+          }
+
+          break;
+        }
+
+        return new Response(JSON.stringify({ amount: null, status: 'pending' }), { headers: { 'Content-Type': 'application/json' } });
+      }
+    } catch (err) {
+      console.error('OrderKuota bridge error:', err.message);
+      return new Response(JSON.stringify({ success: false, message: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  return nativeFetch(resource, options);
+};
 
 // Load data welcome jika ada
 if (fs.existsSync(welcomeFile)) {
@@ -290,9 +385,61 @@ function saveAllowedGroups(groups) {
   fs.writeFileSync(sviddepo, JSON.stringify(groups, null, 2));
 }
 
-const bot = new TelegramBot(token, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: false, request: telegramRequestOptions });
 
-bot.on('polling_error', (err) => console.error("Polling error:", err));
+let pollingStopped = false;
+const MAX_POLLING_RETRY = 3;
+
+async function startBotPolling(retry = 0) {
+  try {
+    pollingStopped = false;
+    await bot.startPolling();
+  } catch (err) {
+    const message = err?.message || err;
+
+    if (retry < MAX_POLLING_RETRY) {
+      const nextRetry = retry + 1;
+      const delay = 5000 * nextRetry;
+      console.error(`Gagal memulai polling (percobaan ${nextRetry}/${MAX_POLLING_RETRY}):`, message);
+      console.error(`Mencoba ulang dalam ${delay / 1000} detik...`);
+      setTimeout(() => startBotPolling(nextRetry), delay);
+      return;
+    }
+
+    pollingStopped = true;
+    console.error('Gagal memulai polling setelah beberapa percobaan:', message);
+    if (!TELEGRAM_PROXY) {
+      console.error('Jika koneksi diblokir proxy, set TELEGRAM_PROXY atau settings.telegram_proxy.');
+    }
+  }
+}
+
+startBotPolling();
+
+bot.on('polling_error', async (err) => {
+  const message = err?.message || err?.toString?.() || 'Unknown polling error';
+  console.error("Polling error:", message);
+
+  const isProxyBlocked = /tunneling socket could not be established/i.test(message);
+  const isFatal = err?.code === 'EFATAL' || /socket hang up|ECONN|EHOST/i.test(message);
+
+  // Hentikan polling untuk error fatal supaya tidak spam log dan memberi
+  // kesempatan user memperbaiki koneksi.
+  if ((isProxyBlocked || isFatal) && !pollingStopped) {
+    pollingStopped = true;
+    if (isProxyBlocked) {
+      console.error("Koneksi ke Telegram diblokir oleh proxy. Pastikan server bisa akses api.telegram.org tanpa proxy atau set TELEGRAM_PROXY.");
+    } else {
+      console.error("Terjadi error koneksi fatal. Cek token bot, jaringan server, atau set proxy khusus TELEGRAM_PROXY bila diperlukan.");
+    }
+
+    try {
+      await bot.stopPolling();
+    } catch (stopErr) {
+      console.error("Gagal menghentikan polling setelah error proxy:", stopErr?.message || stopErr);
+    }
+  }
+});
 
 const EXPIRATION_TIME = 570000; // 9 menit 30 detik
 const CHECK_INTERVAL = 15000;   // 15 detik
@@ -799,8 +946,6 @@ const donasiData = {
 };
 
 // ✅ Event ketika bot sudah siap
-bot.on('polling_error', console.log); // handle error polling
-
 bot.getMe().then(() => {
     console.log('✅ 𝐁𝐨𝐭 𝐁𝐞𝐫𝐡𝐚𝐬𝐢𝐥 𝐀𝐤𝐭𝐢𝐟 𝐓𝐮𝐚𝐧');
     // Kirim pesan ke owner
@@ -809,6 +954,8 @@ bot.getMe().then(() => {
         `👤 𝐍𝐚𝐦𝐚: ${nama}\n` +
         `📜 𝐏𝐞𝐬𝐚𝐧: ${donasiData.pesan}`
     );
+}).catch((err) => {
+    console.error('Gagal menginisialisasi bot:', err?.message || err);
 });
 // Informasi waktu mulai bot
 
@@ -1903,15 +2050,24 @@ ini adalah  database menu:
 };
 
 const sendFiturMenu = (chatId, messageId, username) => {
-    const caption =
-`\`\`\`
+    const caption = BUSINESS_ONLY
+        ? `\`\`\`
+Haii @${username}
+Mode bisnis aktif. Fitur hiburan seperti cek pacar, khodam, musik, dan AI publik dinonaktifkan.
+
+Gunakan perintah transaksi & operasional:
+/cekid, /idch, /topupsaldo <nominal>, /tourl <link>, /cekstatus, /listdb, dll.
+
+🧑‍💻Developer: @Jeeyhosting
+\`\`\``
+        : `\`\`\`
 Haii @${username}
 ini adalah fitur menu:
 
 /idch
 /cekid
-/cekpacar 
-/cekkendaraan 
+/cekpacar
+/cekkendaraan
 /cekkhodam
 /infocuaca <daerah>
 /playmusik <namalagu>
@@ -2241,6 +2397,8 @@ bot.onText(/\/cekpacar/, (msg) => {
     const chatId = msg.chat.id;
     const username = msg.from.username || msg.from.first_name;
 
+    if (blockIfBusinessMode(chatId, '/cekpacar')) return;
+
     // Daftar nama pacar yang dipilih secara acak
     const pacarList = [
         "Siti", "Senti", "Sifa", "Aprel", "Ika", "Cahya", "Mifta", 
@@ -2259,6 +2417,8 @@ bot.onText(/\/cekpacar/, (msg) => {
 bot.onText(/\/cekkhodam\s*/i, (msg) => {
     const chatId = msg.chat.id;
     const username = msg.from.username || msg.from.first_name;
+
+    if (blockIfBusinessMode(chatId, '/cekkhodam')) return;
 
     // Daftar Khodam yang dipilih secara acak
     const khodamList = [
@@ -2287,6 +2447,8 @@ const kendaraanImages = [
 bot.onText(/\/cekkendaraan\s*/i, (msg) => {
     const chatId = msg.chat.id;
     const username = msg.from.username || msg.from.first_name;
+
+    if (blockIfBusinessMode(chatId, '/cekkendaraan')) return;
 
     // Pilih gambar kendaraan secara acak
     const randomImage = kendaraanImages[Math.floor(Math.random() * kendaraanImages.length)];
@@ -6633,6 +6795,7 @@ bot.onText(/^(\.|\#|\/)bcgc (.+)/, async (msg, match) => {
   
 bot.onText(/\/tiktok (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
+    if (blockIfBusinessMode(chatId, '/tiktok')) return;
     const text = match[1]; // Mengambil teks setelah perintah /tt
 
     if (!text.startsWith("https://")) {
@@ -7305,6 +7468,8 @@ bot.onText(/^(\.|\#|\/)sifat\s?(.*)/i, async (msg, match) => {
     const reply = msg.reply_to_message;
     const text = match[2]?.trim();
 
+    if (blockIfBusinessMode(chatId, '/sifat')) return;
+
     if (!text) {
         return bot.sendMessage(chatId, `📌 Contoh: /sifat Jeey, 7, 7, 2005`, {
             reply_to_message_id: reply?.message_id || msg.message_id,
@@ -7351,6 +7516,8 @@ bot.onText(/^(\.|\#|\/)zodiak\s?(.*)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const reply = msg.reply_to_message;
     const text = match[2]?.trim();
+
+    if (blockIfBusinessMode(chatId, '/zodiak')) return;
 
     if (!text) {
         return bot.sendMessage(chatId, `📅 Contoh: /zodiak 4 7 2005\n\nFormat:\n/zodiak [tanggal] [bulan] [tahun]`, {
@@ -7445,6 +7612,8 @@ bot.onText(/^(\.|\#|\/)artinama\s?(.*)/i, async (msg, match) => {
     const chatId = msg.chat.id;
     const reply = msg.reply_to_message;
     const text = match[2]?.trim();
+
+    if (blockIfBusinessMode(chatId, '/artinama')) return;
 
     if (!text) {
         return bot.sendMessage(chatId, `🔍 Contoh: /artinama Jeeyhosting`, {
@@ -10754,6 +10923,8 @@ bot.onText(/^(\.|\#|\/)aigpt|gptpro(?:\s+(.+))?$/, async (msg, match) => {
   const reply = msg.reply_to_message; // pesan yang direply
   const targetMessageId = reply ? reply.message_id : msg.message_id;
 
+  if (blockIfBusinessMode(chatId, '/aigpt')) return;
+
   // ✅ Cek apakah user adalah Owner
   if (userId !== owner) {
     return bot.sendMessage(chatId, "❌ Akses ditolak! Hanya owner yang dapat menggunakan perintah ini.", {
@@ -10812,6 +10983,8 @@ bot.onText(/^(\.|\#|\/)aigpt|gptpro(?:\s+(.+))?$/, async (msg, match) => {
 bot.onText(/^([./#])autoai\s*(on|off|reset)?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const action = match[2] ? match[2].toLowerCase() : null;
+
+  if (blockIfBusinessMode(chatId, '/autoai')) return;
 
   if (!action) {
     return bot.sendMessage(chatId, `Contoh:\n/autoai on\n/autoai off\n/autoai reset`);
@@ -12547,6 +12720,8 @@ bot.onText(/^(\.|\#|\/)tofigure$/, async (msg) => {
   const reply = msg.reply_to_message;
   const targetMessageId = reply ? reply.message_id : msg.message_id;
 
+  if (blockIfBusinessMode(chatId, '/tofigure')) return;
+
   // Cek apakah user adalah owner
   if (userId !== owner) {
     return bot.sendMessage(chatId, "❌ Akses ditolak! Hanya owner yang dapat menggunakan perintah ini.", {
@@ -12606,6 +12781,8 @@ bot.onText(/^(\.|\#|\/)hd$/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id.toString();
     const reply = msg.reply_to_message;
+
+    if (blockIfBusinessMode(chatId, '/hd')) return;
 
     if (userId !== owner) {
         return bot.sendMessage(chatId, "❌ Akses ditolak! Hanya owner yang dapat menggunakan perintah ini.", {
@@ -12670,6 +12847,8 @@ bot.onText(/^(\.|\#|\/)iqc(?:\s+(.+))?$/, async (msg, match) => {
     const targetMessageId = reply ? reply.message_id : msg.message_id;
     const text = match[2]; // teks setelah command
 
+    if (blockIfBusinessMode(chatId, '/iqc')) return;
+
     // Cek owner
     if (userId !== owner) {
         return bot.sendMessage(chatId, "❌ Akses ditolak! Hanya owner yang dapat menggunakan perintah ini.", {
@@ -12731,11 +12910,13 @@ bot.onText(/^(\.|\#|\/)iqc(?:\s+(.+))?$/, async (msg, match) => {
 
 bot.onText(/^(\.|\#|\/)brat$/, async (msg) => {
     const chatId = msg.chat.id;
+    if (blockIfBusinessMode(chatId, '/brat')) return;
     bot.sendMessage(chatId, `Format salah example /brat katakatabebas`);
   });
 
 bot.onText(/\/brat (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
+    if (blockIfBusinessMode(chatId, '/brat')) return;
     const text = match[1];
 
     if (!text) {
@@ -15163,6 +15344,8 @@ bot.onText(/^(\.|\#|\/)playmusik(?:\s+(.+))?$/i, async (msg, match) => {
     const userId = msg.from.id.toString();
     const text = match[2];
     const targetMessageId = msg.message_id;
+
+      if (blockIfBusinessMode(chatId, '/playmusik')) return;
 
       if (userId !== owner) {
     return bot.sendMessage(chatId, "❌ Akses ditolak! Hanya owner yang dapat menggunakan perintah ini.", {
